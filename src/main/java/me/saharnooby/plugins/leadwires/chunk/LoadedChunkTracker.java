@@ -1,9 +1,25 @@
 package me.saharnooby.plugins.leadwires.chunk;
 
-import com.comphenix.protocol.PacketType;
-import com.comphenix.protocol.events.PacketAdapter;
-import com.comphenix.protocol.events.PacketContainer;
-import com.comphenix.protocol.events.PacketEvent;
+import com.github.retrooper.packetevents.PacketEvents;
+import com.github.retrooper.packetevents.event.PacketListener;
+import com.github.retrooper.packetevents.event.PacketListenerPriority;
+import com.github.retrooper.packetevents.event.PacketSendEvent;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType;
+import com.github.retrooper.packetevents.protocol.packettype.PacketType.Play.Server;
+import com.github.retrooper.packetevents.protocol.packettype.PacketTypeCommon;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerChunkData;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerChunkDataBulk;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerUnloadChunk;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.stream.Stream;
 import lombok.NonNull;
 import me.saharnooby.plugins.leadwires.chunk.event.ChunkSentEvent;
 import me.saharnooby.plugins.leadwires.chunk.event.ChunkUnloadSentEvent;
@@ -18,16 +34,11 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
 
-import java.util.*;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.util.stream.Stream;
-
 /**
  * @author saharNooby
  * @since 10:35 25.03.2020
  */
-public final class LoadedChunkTracker extends PacketAdapter implements Listener {
+public final class LoadedChunkTracker implements Listener, PacketListener {
 
 	private final Thread mainThread;
 
@@ -36,9 +47,9 @@ public final class LoadedChunkTracker extends PacketAdapter implements Listener 
 	private final ReadWriteLock lock = new ReentrantReadWriteLock();
 
 	public LoadedChunkTracker(@NonNull Plugin plugin) {
-		super(plugin, getPacketTypesToListen());
-
 		this.mainThread = Thread.currentThread();
+
+		PacketEvents.getAPI().getEventManager().registerListener(this, PacketListenerPriority.HIGHEST);
 
 		// Add all online players guessing their loaded chunks.
 		// This is needed in order to handle /reload correctly.
@@ -46,15 +57,13 @@ public final class LoadedChunkTracker extends PacketAdapter implements Listener 
 	}
 
 	@Override
-	@SuppressWarnings("deprecation")
-	public void onPacketSending(PacketEvent e) {
-		if (e.isCancelled()) {
+	public void onPacketSend(PacketSendEvent event) {
+		if (event.isCancelled()) {
 			return;
 		}
 
-		Player player = e.getPlayer();
-		PacketContainer packet = e.getPacket();
-		PacketType type = packet.getType();
+		Player player = event.getPlayer();
+		PacketTypeCommon type = event.getPacketType();
 
 		List<ChunkCoord> loaded = null;
 		ChunkCoord unloaded = null;
@@ -63,38 +72,37 @@ public final class LoadedChunkTracker extends PacketAdapter implements Listener 
 		try {
 			Set<ChunkCoord> set = this.loaded.computeIfAbsent(player, k -> new HashSet<>());
 
-			if (type == PacketType.Play.Server.MAP_CHUNK) {
-				ChunkCoord coord = new ChunkCoord(packet.getIntegers().read(0), packet.getIntegers().read(1));
+			switch (type) {
+				case Server.CHUNK_DATA -> {
+					WrapperPlayServerChunkData packet = new WrapperPlayServerChunkData(event);
+					ChunkCoord coord = new ChunkCoord(packet.getColumn().getX(), packet.getColumn().getZ());
 
-				if (NMSUtil.getMinorVersion() < 9) {
-					if (isUnloadPacket(packet)) {
-						unloaded = coord;
-						set.remove(coord);
-					}
-				} else {
 					loaded = Collections.singletonList(coord);
 					set.add(coord);
+
 				}
-			} else if (type == PacketType.Play.Server.MAP_CHUNK_BULK) {
-				int[] xs = packet.getIntegerArrays().read(0);
-				int[] zs = packet.getIntegerArrays().read(1);
-				loaded = new ArrayList<>(xs.length);
-				for (int i = 0; i < xs.length; i++) {
-					ChunkCoord coord = new ChunkCoord(xs[i], zs[i]);
-					loaded.add(coord);
-					set.add(coord);
+				case Server.MAP_CHUNK_BULK -> {
+					WrapperPlayServerChunkDataBulk packet = new WrapperPlayServerChunkDataBulk(event);
+					int[] xs = packet.getX();
+					int[] zs = packet.getZ();
+					loaded = new ArrayList<>(xs.length);
+					for (int i = 0; i < xs.length; i++) {
+						ChunkCoord coord = new ChunkCoord(xs[i], zs[i]);
+						loaded.add(coord);
+						set.add(coord);
+					}
 				}
-			} else if (type == PacketType.Play.Server.RESPAWN) {
-				set.clear();
-			} else {
-		                ChunkCoord coord;
-				if ((NMSUtil.getMinorVersion() >= 20 && NMSUtil.getReleaseVersion() > 1) || NMSUtil.getMinorVersion() >= 21) {
-		                    coord = new ChunkCoord(packet.getStructures().read(0).getIntegers().read(0), packet.getStructures().read(0).getIntegers().read(1));
-		                } else {
-		                    coord = new ChunkCoord(packet.getIntegers().read(0), packet.getIntegers().read(1));
-		                }
-				unloaded = coord;
-				set.remove(coord);
+				case Server.RESPAWN -> set.clear();
+				case Server.UNLOAD_CHUNK -> {
+					WrapperPlayServerUnloadChunk packet = new WrapperPlayServerUnloadChunk(event);
+					ChunkCoord coord = new ChunkCoord(packet.getChunkX(), packet.getChunkZ());
+
+					unloaded = coord;
+					set.remove(coord);
+				}
+				case null, default -> {
+					return;
+				}
 			}
 		} finally {
 			this.lock.writeLock().unlock();
@@ -113,7 +121,9 @@ public final class LoadedChunkTracker extends PacketAdapter implements Listener 
 		if (type == PacketType.Play.Server.RESPAWN) {
 			Bukkit.getPluginManager().callEvent(new RespawnSentEvent(isAsync, player));
 		}
+
 	}
+
 
 	@EventHandler(priority = EventPriority.MONITOR)
 	public void onPlayerQuit(PlayerQuitEvent e) {
@@ -151,35 +161,6 @@ public final class LoadedChunkTracker extends PacketAdapter implements Listener 
 			}
 		} finally {
 			this.lock.writeLock().unlock();
-		}
-	}
-
-	@SuppressWarnings("deprecation")
-	private static PacketType[] getPacketTypesToListen() {
-		return Stream.of(
-				PacketType.Play.Server.MAP_CHUNK,
-				PacketType.Play.Server.MAP_CHUNK_BULK,
-				PacketType.Play.Server.UNLOAD_CHUNK,
-				PacketType.Play.Server.RESPAWN
-		).filter(PacketType::isSupported).toArray(PacketType[]::new);
-	}
-
-	// https://wiki.vg/index.php?title=Protocol&oldid=7368#Chunk_Data
-	private static boolean isUnloadPacket(@NonNull PacketContainer packet) {
-		boolean groundUp = packet.getBooleans().read(0);
-
-		if (!groundUp) {
-			return false;
-		}
-
-		Object data = packet.getModifier().read(2);
-
-		try {
-			int bitmask = (int) data.getClass().getField("b").get(data) & 0xFFFF;
-
-			return bitmask == 0;
-		} catch (IllegalAccessException | NoSuchFieldException e) {
-			throw new RuntimeException(e);
 		}
 	}
 
